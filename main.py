@@ -1,35 +1,33 @@
 #!/usr/bin/env python3
 """
 Advanced Real-Time Speech Transcription System
-Optimized for Hinglish and Indian accents with enhanced performance
+Optimized for Hinglish and Indian accents with enhanced performance and TTS
 """
 
 import argparse
 import os
 import sys
-import json
 import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from queue import Queue, Empty
-from typing import Optional, List, Dict, Tuple
+from queue import Queue
+from typing import Optional, Dict, Tuple
 import warnings
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import whisper
 from whisper.audio import SAMPLE_RATE
 import speech_recognition as sr
 from scipy import signal
 import webrtcvad
 import librosa
-import langdetect
 from langdetect import detect, LangDetectException
-import argostranslate.package
-import argostranslate.translate
+
+# Import the advanced TTS system
+from tts import AdvancedTTS, TTSConfig
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -39,25 +37,31 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 def install_translation_models():
     """Download and install Argos Translate models for supported languages."""
-    print("Checking for translation models...")
-    required_languages = {"hi", "mr", "ta"}
-    argostranslate.package.update_package_index()
-    available_packages = argostranslate.package.get_available_packages()
-    installed_languages = {lang.from_code for lang in argostranslate.translate.get_installed_languages()}
+    try:
+        import argostranslate.package
+        import argostranslate.translate
+        print("Checking for translation models...")
+        required_languages = {"hi", "mr", "ta"}
+        argostranslate.package.update_package_index()
+        available_packages = argostranslate.package.get_available_packages()
+        installed_languages = {lang.code for lang in argostranslate.translate.get_installed_languages()}
 
-    for lang_code in required_languages:
-        if lang_code not in installed_languages:
-            print(f"Downloading translation model for '{lang_code}'...")
-            try:
-                package_to_install = next(
-                    p for p in available_packages if p.from_code == lang_code and p.to_code == 'en'
-                )
-                package_to_install.install()
-                print(f"Model for '{lang_code}' installed successfully.")
-            except StopIteration:
-                print(f"Warning: Could not find translation package for '{lang_code}' to 'en'.")
-            except Exception as e:
-                print(f"Error installing model for '{lang_code}': {e}")
+        for lang_code in required_languages:
+            if lang_code not in installed_languages:
+                print(f"Downloading translation model for '{lang_code}'...")
+                try:
+                    package_to_install = next(
+                        p for p in available_packages if p.from_code == lang_code and p.to_code == 'en'
+                    )
+                    package_to_install.install()
+                    print(f"Model for '{lang_code}' installed successfully.")
+                except StopIteration:
+                    print(f"Warning: Could not find translation package for '{lang_code}' to 'en'.")
+                except Exception as e:
+                    print(f"Error installing model for '{lang_code}': {e}")
+    except ImportError:
+        print("Warning: argostranslate not found. Translation will be disabled.")
+        print("Please install it with: pip install argostranslate")
 
 def detect_language(text: str) -> str:
     """Detect the language of a given text."""
@@ -71,6 +75,7 @@ def detect_language(text: str) -> str:
 def translate_text(text: str, from_code: str, to_code: str = "en") -> str:
     """Translate text from a source language to a target language."""
     try:
+        import argostranslate.translate
         translation = argostranslate.translate.translate(text, from_code, to_code)
         return translation
     except Exception as e:
@@ -79,227 +84,103 @@ def translate_text(text: str, from_code: str, to_code: str = "en") -> str:
 class AudioProcessor:
     """Advanced audio processing for better transcription quality"""
     
-    def __init__(self, sample_rate: int = 16000):
+    def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sample_rate = sample_rate
         self.vad = webrtcvad.Vad(2)  # Aggressiveness level 2
-        self.noise_profile = None
         
     def preprocess_audio(self, audio_data: np.ndarray) -> np.ndarray:
         """Enhanced audio preprocessing pipeline"""
-        # Normalize audio
+        if audio_data.size == 0:
+            return audio_data
         audio_data = audio_data / np.max(np.abs(audio_data) + 1e-8)
-        
-        # Apply high-pass filter to remove low-frequency noise
         sos = signal.butter(4, 80, btype='high', fs=self.sample_rate, output='sos')
         audio_data = signal.sosfilt(sos, audio_data)
-        
-        # Apply dynamic range compression
-        audio_data = np.sign(audio_data) * np.power(np.abs(audio_data), 0.7)
-        
-        # Spectral gating noise reduction
-        if self.noise_profile is not None:
-            audio_data = self._spectral_gating(audio_data)
-            
         return audio_data.astype(np.float32)
     
-    def _spectral_gating(self, audio: np.ndarray, alpha: float = 2.0) -> np.ndarray:
-        """Spectral gating for noise reduction"""
-        stft = librosa.stft(audio, n_fft=512, hop_length=128)
-        magnitude = np.abs(stft)
-        phase = np.angle(stft)
-        
-        # Apply spectral gating
-        magnitude_db = librosa.amplitude_to_db(magnitude)
-        noise_floor = np.percentile(magnitude_db, 25)
-        mask = magnitude_db > (noise_floor + alpha)
-        
-        cleaned_magnitude = magnitude * mask
-        cleaned_stft = cleaned_magnitude * np.exp(1j * phase)
-        
-        return librosa.istft(cleaned_stft, hop_length=128)
-    
     def detect_speech(self, audio_chunk: bytes) -> bool:
-        """Voice activity detection"""
         try:
             return self.vad.is_speech(audio_chunk, self.sample_rate)
-        except:
+        except Exception:
             return True
 
 class TranscriptionBuffer:
     """Smart buffer management for smooth transcription"""
     
-    def __init__(self, max_lines: int = 50):
-        self.lines = deque(maxlen=max_lines)
+    def __init__(self, max_lines: int = 15):
+        self.transcript = deque(maxlen=max_lines)
         self.current_line = ""
-        self.confidence_scores = deque(maxlen=max_lines)
-        self.timestamps = deque(maxlen=max_lines)
-        self.languages = deque(maxlen=max_lines)
-        self.translations = deque(maxlen=max_lines)
         
-    def add_line(self, text: str, confidence: float = 0.0, lang: str = "", translation: str = ""):
-        """Add a complete line to the buffer"""
+    def add_line(self, text: str, confidence: float, lang: str, translation: str):
         if text.strip():
-            self.lines.append(text.strip())
-            self.confidence_scores.append(confidence)
-            self.timestamps.append(datetime.now())
-            self.languages.append(lang)
-            self.translations.append(translation)
+            self.transcript.append((datetime.now(), text.strip(), lang, translation, confidence))
+            self.current_line = ""
     
     def update_current(self, text: str):
-        """Update the current line being transcribed"""
         self.current_line = text.strip()
     
     def get_display_text(self) -> str:
-        """Get formatted text for display"""
         display_lines = []
-        for i, line in enumerate(self.lines):
-            lang = self.languages[i]
-            translation = self.translations[i]
+        for _, line, lang, translation, _ in self.transcript:
             display_line = f"[{lang}] {line}"
             if translation:
                 display_line += f" -> (EN: {translation})"
             display_lines.append(display_line)
-
         if self.current_line:
-            display_lines.append(f"🎤 {self.current_line}")
+            display_lines.append(f" {self.current_line}")
         return "\n".join(display_lines)
     
     def export_transcript(self, filename: str):
-        """Export transcript with timestamps"""
         with open(filename, 'w', encoding='utf-8') as f:
             f.write("Real-Time Transcription Log\n")
-            f.write("=" * 50 + "\n\n")
-            for i, (line, timestamp) in enumerate(zip(self.lines, self.timestamps)):
-                f.write(f"[{timestamp.strftime('%H:%M:%S')}] {line}\n")
+            f.write("="*30 + "\n")
+            for timestamp, line, lang, translation, confidence in self.transcript:
+                f.write(f"[{timestamp.strftime('%H:%M:%S')}] [{lang}] (Conf: {confidence:.2f}) {line}")
+                if translation:
+                    f.write(f" -> (EN: {translation})")
+                f.write("\n")
 
 class SmartTranscriber:
     """Advanced transcription engine with Hinglish optimization"""
     
-    def __init__(self, model_name: str = "base", device: str = "auto"):
+    def __init__(self, model_name: str, device: str):
         self.device = self._get_optimal_device(device)
         self.model = self._load_optimized_model(model_name)
         self.audio_processor = AudioProcessor()
         self.buffer = TranscriptionBuffer()
         
-        # Hinglish-specific optimizations
-        self.hinglish_replacements = self._load_hinglish_corrections()
-        self.context_window = deque(maxlen=5)  # Context for better accuracy
-        
     def _get_optimal_device(self, device: str) -> str:
-        """Determine optimal device for processing"""
         if device == "auto":
-            if torch.cuda.is_available():
-                return "cuda"
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                return "mps"
-            else:
-                return "cpu"
+            if torch.cuda.is_available(): return "cuda"
+            if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available(): return "mps"
         return device
     
     def _load_optimized_model(self, model_name: str):
-        """Load and optimize Whisper model"""
         print(f"Loading {model_name} model on {self.device}...")
-        
-        # Load model with optimizations
         model = whisper.load_model(model_name, device=self.device)
-        
-        # Enable optimizations for faster inference
         if self.device == "cuda":
-            model = model.half()  # Use FP16 for faster processing
-            
+            model = model.half()
         model.eval()
         return model
     
-    def _load_hinglish_corrections(self) -> Dict[str, str]:
-        """Load Hinglish-specific corrections and common phrases"""
-        return {
-            # Common Hinglish words that Whisper might mishear
-            "achha": "अच्छा",
-            "theek hai": "ठीक है", 
-            "kya baat hai": "क्या बात है",
-            "namaste": "नमस्ते",
-            "dhanyawad": "धन्यवाद",
-            "kaise ho": "कैसे हो",
-            "matlab": "मतलब",
-            "bilkul": "बिल्कुल",
-            "zaroor": "जरूर",
-            "samajh gaya": "समझ गया",
-            # Add more based on your specific needs
-        }
-    
-    def transcribe_chunk(self, audio_data: np.ndarray, is_final: bool = False) -> Tuple[str, float]:
-        """Transcribe audio chunk with enhanced processing"""
-        if len(audio_data) < 1600:  # Too short
-            return "", 0.0
-            
-        # Preprocess audio
+    def transcribe_chunk(self, audio_data: np.ndarray) -> Tuple[str, float]:
+        if audio_data.size < 100: return "", 0.0
         processed_audio = self.audio_processor.preprocess_audio(audio_data)
-        
-        # Pad audio to ensure minimum length
-        min_length = 16000  # 1 second minimum
-        if len(processed_audio) < min_length:
-            processed_audio = np.pad(processed_audio, (0, min_length - len(processed_audio)))
-        
         try:
-            # Enhanced transcription options for Indian languages
             result = self.model.transcribe(
-                processed_audio,
-                language="hi",  # Hindi for better Hinglish support
-                task="transcribe",
-                fp16=self.device == "cuda",
-                temperature=0.2,  # Lower temperature for more consistent results
-                compression_ratio_threshold=2.4,
-                logprob_threshold=-1.0,
-                no_speech_threshold=0.6,
-                condition_on_previous_text=True,
-                initial_prompt="This is a conversation in Hinglish (Hindi-English mix) with Indian accent."
+                processed_audio, language="hi", task="transcribe", fp16=(self.device == "cuda"),
+                temperature=0.2, no_speech_threshold=0.6,
+                initial_prompt="This is a conversation in Hinglish (Hindi-English mix) with an Indian accent."
             )
-            
             text = result.get("text", "").strip()
-            
-            # Calculate confidence score
             segments = result.get("segments", [])
-            confidence = np.mean([seg.get("avg_logprob", -1) for seg in segments]) if segments else 0.0
-            confidence = max(0, min(1, (confidence + 1) / 2))  # Normalize to 0-1
-            
-            # Apply Hinglish corrections
-            text = self._apply_hinglish_corrections(text)
-            
-            # Context-aware improvements
-            text = self._apply_context_corrections(text)
-            
+            if not segments:
+                return "", 0.0
+            confidence = np.mean([seg.get("no_speech_prob", 1.0) for seg in segments])
+            confidence = 1 - confidence # Invert because it's no_speech_prob
             return text, confidence
-            
         except Exception as e:
             print(f"Transcription error: {e}")
             return "", 0.0
-    
-    def _apply_hinglish_corrections(self, text: str) -> str:
-        """Apply Hinglish-specific corrections"""
-        for wrong, correct in self.hinglish_replacements.items():
-            text = text.replace(wrong, correct)
-        return text
-    
-    def _apply_context_corrections(self, text: str) -> str:
-        """Apply context-aware corrections based on conversation history"""
-        # Add context to improve accuracy
-        self.context_window.append(text)
-        
-        # Simple context-based corrections
-        context = " ".join(self.context_window)
-        
-        # Example: Fix common misheard phrases based on context
-        corrections = [
-            ("i am", "I am"),
-            ("you are", "You are"),
-            ("what is", "What is"),
-            ("how are", "How are"),
-        ]
-        
-        for wrong, correct in corrections:
-            text = text.replace(wrong, correct)
-            
-        return text
 
 class RealTimeTranscriber:
     """Main real-time transcription system"""
@@ -309,193 +190,127 @@ class RealTimeTranscriber:
         self.transcriber = SmartTranscriber(args.model, args.device)
         self.data_queue = Queue()
         self.phrase_time = None
-        
-        # Setup microphone
+        self.last_sample = bytes()
         self.setup_microphone()
-        
-        # Performance monitoring
-        self.stats = {
-            "chunks_processed": 0,
-            "avg_confidence": 0.0,
-            "start_time": datetime.now()
-        }
+        self.stats = {"chunks_processed": 0, "total_confidence": 0.0, "start_time": datetime.now()}
     
     def setup_microphone(self):
-        """Setup microphone with optimal settings"""
         self.recorder = sr.Recognizer()
         self.recorder.energy_threshold = self.args.energy_threshold
         self.recorder.dynamic_energy_threshold = self.args.dynamic_energy
-        self.recorder.pause_threshold = 0.5
+        self.recorder.pause_threshold = self.args.pause_threshold
         
-        # Platform-specific microphone setup
-        if sys.platform.startswith('linux'):
+        if sys.platform.startswith('linux') and self.args.default_microphone != 'default':
             self.setup_linux_microphone()
         else:
-            self.source = sr.Microphone(sample_rate=16000, chunk_size=512)
-        
-        # Calibrate for ambient noise
+            self.source = sr.Microphone(sample_rate=SAMPLE_RATE)
+            
         print("Calibrating microphone for ambient noise...")
         with self.source:
-            self.recorder.adjust_for_ambient_noise(self.source, duration=2)
+            self.recorder.adjust_for_ambient_noise(self.source, duration=1)
         print(f"Microphone calibrated. Energy threshold: {self.recorder.energy_threshold}")
     
     def setup_linux_microphone(self):
-        """Linux-specific microphone setup"""
         mic_name = self.args.default_microphone
         if mic_name == 'list':
             self.list_microphones()
             sys.exit(0)
-        
         for index, name in enumerate(sr.Microphone.list_microphone_names()):
             if mic_name in name:
-                self.source = sr.Microphone(sample_rate=16000, device_index=index, chunk_size=512)
+                self.source = sr.Microphone(sample_rate=SAMPLE_RATE, device_index=index)
                 return
-        
         print(f"Microphone '{mic_name}' not found. Using default.")
-        self.source = sr.Microphone(sample_rate=16000, chunk_size=512)
+        self.source = sr.Microphone(sample_rate=SAMPLE_RATE)
     
     def list_microphones(self):
-        """List available microphones"""
         print("\nAvailable microphone devices:")
         print("-" * 40)
         for index, name in enumerate(sr.Microphone.list_microphone_names()):
             print(f"{index:2d}: {name}")
     
-    def record_callback(self, _, audio: sr.AudioData) -> None:
-        """Callback for audio recording"""
-        data = audio.get_raw_data()
-        self.data_queue.put(data)
+    def record_callback(self, _, audio: sr.AudioData):
+        self.data_queue.put(audio.get_raw_data())
     
     def display_interface(self):
-        """Display enhanced user interface"""
         os.system('cls' if os.name == 'nt' else 'clear')
-        
-        print("🎙️  ADVANCED REAL-TIME SPEECH TRANSCRIPTION")
+        print("  ADVANCED REAL-TIME SPEECH TRANSCRIPTION & TTS")
         print("=" * 60)
-        print(f"Model: {self.args.model} | Device: {self.transcriber.device}")
-        print(f"Language: Hinglish/Hindi | Confidence Threshold: {self.args.confidence_threshold}")
-        print("-" * 60)
-        
-        # Display statistics
+        print(f"Model: {self.args.model} | Device: {self.transcriber.device} | Lang: Hinglish/Hindi")
         runtime = datetime.now() - self.stats["start_time"]
-        print(f"⏱️  Runtime: {str(runtime).split('.')[0]} | "
-              f"Chunks: {self.stats['chunks_processed']} | "
-              f"Avg Confidence: {self.stats['avg_confidence']:.2f}")
+        avg_conf = (self.stats['total_confidence'] / self.stats['chunks_processed']) if self.stats['chunks_processed'] > 0 else 0
+        print(f"  Runtime: {str(runtime).split('.')[0]} | Chunks: {self.stats['chunks_processed']} | Avg Conf: {avg_conf:.2f}")
         print("-" * 60)
-        
-        # Display transcription
         print(self.transcriber.buffer.get_display_text())
         print("\n" + "─" * 60)
         print("Press Ctrl+C to stop and save transcript")
     
-    def run(self):
-        """Main transcription loop"""
-        print("Starting background recording...")
-        
-        # Start background recording
-        self.recorder.listen_in_background(
-            self.source, 
-            self.record_callback, 
-            phrase_time_limit=self.args.record_timeout
-        )
-        
-        print("🎤 Listening... Speak now!")
-        
-        try:
-            while True:
-                self.process_audio_queue()
-                time.sleep(0.1)  # Small delay to prevent excessive CPU usage
-                
-        except KeyboardInterrupt:
-            self.cleanup()
+    def run(self, tts_engine: Optional[AdvancedTTS] = None):
+        self.recorder.listen_in_background(self.source, self.record_callback, phrase_time_limit=self.args.record_timeout)
+        print("\n--- Listening... ---")
+        while True:
+            self.process_audio_queue(tts_engine)
+            self.display_interface()
+            time.sleep(0.1)
     
-    def process_audio_queue(self):
-        """Process audio data from queue"""
-        if self.data_queue.empty():
-            return
-        
+    def process_audio_queue(self, tts_engine: Optional[AdvancedTTS] = None):
         now = datetime.now()
-        phrase_complete = False
-        
-        # Check if phrase is complete
-        if (self.phrase_time and 
-            now - self.phrase_time > timedelta(seconds=self.args.phrase_timeout)):
-            phrase_complete = True
-        
-        self.phrase_time = now
-        
-        # Collect audio data
-        audio_data = b''
-        while not self.data_queue.empty():
-            try:
-                audio_data += self.data_queue.get_nowait()
-            except Empty:
-                break
-        
-        if not audio_data:
-            return
-        
-        # Convert to numpy array
-        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-        
-        # Transcribe
-        text, confidence = self.transcriber.transcribe_chunk(audio_np, phrase_complete)
-        
-        # Update statistics
-        self.stats["chunks_processed"] += 1
-        self.stats["avg_confidence"] = (
-            (self.stats["avg_confidence"] * (self.stats["chunks_processed"] - 1) + confidence) 
-            / self.stats["chunks_processed"]
-        )
-        
-        # Update buffer based on confidence threshold
-        if confidence >= self.args.confidence_threshold and text:
-            if phrase_complete:
-                lang = detect_language(text)
-                translation = ""
-                if lang in ["hi", "mr", "ta"]:
-                    translation = translate_text(text, lang)
-                self.transcriber.buffer.add_line(text, confidence, lang, translation)
-            else:
-                self.transcriber.buffer.update_current(text)
-        
-        # Update display
-        self.display_interface()
-    
+        if not self.data_queue.empty():
+            phrase_complete = False
+            if self.phrase_time and now - self.phrase_time > timedelta(seconds=self.args.phrase_timeout):
+                self.last_sample = bytes()
+                phrase_complete = True
+            self.phrase_time = now
+
+            audio_buffer = self.last_sample
+            while not self.data_queue.empty():
+                audio_buffer += self.data_queue.get()
+            self.last_sample = audio_buffer
+
+            audio_np = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
+            text, confidence = self.transcriber.transcribe_chunk(audio_np)
+
+            if text and confidence > self.args.confidence_threshold:
+                self.stats["chunks_processed"] += 1
+                self.stats["total_confidence"] += confidence
+                
+                if phrase_complete:
+                    lang = detect_language(text)
+                    translation = translate_text(text, lang) if lang in ["hi", "mr", "ta"] else ""
+                    self.transcriber.buffer.add_line(text, confidence, lang, translation)
+                    if tts_engine and translation and lang != 'en':
+                        tts_engine.speak(translation)
+                else:
+                    self.transcriber.buffer.update_current(text)
+            elif not text:
+                self.transcriber.buffer.update_current("")
+
     def cleanup(self):
-        """Cleanup and save transcript"""
-        print("\n\n🛑 Stopping transcription...")
-        
-        # Save transcript
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"transcript_{timestamp}.txt"
-        self.transcriber.buffer.export_transcript(filename)
-        
-        print(f"💾 Transcript saved to: {filename}")
-        print(f"📊 Total chunks processed: {self.stats['chunks_processed']}")
-        print(f"📈 Average confidence: {self.stats['avg_confidence']:.2f}")
+        print("\nCleaning up and saving transcript...")
+        output_dir = Path("transcripts")
+        output_dir.mkdir(exist_ok=True)
+        filename = output_dir / f"transcript_{datetime.now():%Y-%m-%d_%H-%M-%S}.txt"
+        self.transcriber.buffer.export_transcript(str(filename))
+        print(f"Transcript saved to {filename}")
+        print("Final transcript:")
+        print(self.transcriber.buffer.get_display_text())
 
 def main():
-    """Main function with enhanced argument parsing"""
-    # Install translation models on first run
+    # Initialize Text-to-Speech Engine
+    print("\nInitializing Text-to-Speech engine...")
+    tts_engine = None
+    try:
+        tts_config = TTSConfig(language='en', engine='edge', speed=1.1, volume=0.9)
+        tts_engine = AdvancedTTS(config=tts_config)
+        print("TTS engine initialized successfully.")
+    except Exception as e:
+        print(f"Could not initialize TTS engine: {e}")
+
     install_translation_models()
 
-    parser = argparse.ArgumentParser(
-        description="Advanced Real-Time Speech Transcription with Hinglish Support",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python transcriber.py --model medium --device cuda
-  python transcriber.py --model large --confidence_threshold 0.7
-  python transcriber.py --list_mics  # List available microphones
-        """
-    )
-    
-    # Model options
+    parser = argparse.ArgumentParser(description="Advanced Real-Time Speech Transcription System", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("--model", default="base", 
                        choices=["tiny", "base", "small", "medium", "large"],
                        help="Whisper model to use (default: base)")
-    
     parser.add_argument("--device", default="auto",
                        choices=["auto", "cpu", "cuda", "mps"],
                        help="Device to run model on (default: auto)")
@@ -543,8 +358,15 @@ Examples:
     
     # Create and run transcriber
     transcriber = RealTimeTranscriber(args)
-    transcriber.run()
+    try:
+        transcriber.run(tts_engine=tts_engine)
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt received. Exiting.")
+    finally:
+        if tts_engine:
+            print("\nShutting down TTS engine...")
+            tts_engine.cleanup()
+        transcriber.cleanup()
 
 if __name__ == "__main__":
     main()
-
