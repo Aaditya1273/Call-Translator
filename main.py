@@ -1,108 +1,489 @@
+#!/usr/bin/env python3
+"""
+Advanced Real-Time Speech Transcription System
+Optimized for Hinglish and Indian accents with enhanced performance
+"""
+
 import argparse
 import os
-import numpy as np
-import speech_recognition as sr
-import torch
-import whisper
+import sys
+import json
+import threading
+import time
+from collections import deque
 from datetime import datetime, timedelta
-from queue import Queue
-from time import sleep
-from sys import platform
+from pathlib import Path
+from queue import Queue, Empty
+from typing import Optional, List, Dict, Tuple
+import warnings
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import whisper
+from whisper.audio import SAMPLE_RATE
+import speech_recognition as sr
+from scipy import signal
+import webrtcvad
+import librosa
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+class AudioProcessor:
+    """Advanced audio processing for better transcription quality"""
+    
+    def __init__(self, sample_rate: int = 16000):
+        self.sample_rate = sample_rate
+        self.vad = webrtcvad.Vad(2)  # Aggressiveness level 2
+        self.noise_profile = None
+        
+    def preprocess_audio(self, audio_data: np.ndarray) -> np.ndarray:
+        """Enhanced audio preprocessing pipeline"""
+        # Normalize audio
+        audio_data = audio_data / np.max(np.abs(audio_data) + 1e-8)
+        
+        # Apply high-pass filter to remove low-frequency noise
+        sos = signal.butter(4, 80, btype='high', fs=self.sample_rate, output='sos')
+        audio_data = signal.sosfilt(sos, audio_data)
+        
+        # Apply dynamic range compression
+        audio_data = np.sign(audio_data) * np.power(np.abs(audio_data), 0.7)
+        
+        # Spectral gating noise reduction
+        if self.noise_profile is not None:
+            audio_data = self._spectral_gating(audio_data)
+            
+        return audio_data.astype(np.float32)
+    
+    def _spectral_gating(self, audio: np.ndarray, alpha: float = 2.0) -> np.ndarray:
+        """Spectral gating for noise reduction"""
+        stft = librosa.stft(audio, n_fft=512, hop_length=128)
+        magnitude = np.abs(stft)
+        phase = np.angle(stft)
+        
+        # Apply spectral gating
+        magnitude_db = librosa.amplitude_to_db(magnitude)
+        noise_floor = np.percentile(magnitude_db, 25)
+        mask = magnitude_db > (noise_floor + alpha)
+        
+        cleaned_magnitude = magnitude * mask
+        cleaned_stft = cleaned_magnitude * np.exp(1j * phase)
+        
+        return librosa.istft(cleaned_stft, hop_length=128)
+    
+    def detect_speech(self, audio_chunk: bytes) -> bool:
+        """Voice activity detection"""
+        try:
+            return self.vad.is_speech(audio_chunk, self.sample_rate)
+        except:
+            return True
+
+class TranscriptionBuffer:
+    """Smart buffer management for smooth transcription"""
+    
+    def __init__(self, max_lines: int = 50):
+        self.lines = deque(maxlen=max_lines)
+        self.current_line = ""
+        self.confidence_scores = deque(maxlen=max_lines)
+        self.timestamps = deque(maxlen=max_lines)
+        
+    def add_line(self, text: str, confidence: float = 0.0):
+        """Add a complete line to the buffer"""
+        if text.strip():
+            self.lines.append(text.strip())
+            self.confidence_scores.append(confidence)
+            self.timestamps.append(datetime.now())
+    
+    def update_current(self, text: str):
+        """Update the current line being transcribed"""
+        self.current_line = text.strip()
+    
+    def get_display_text(self) -> str:
+        """Get formatted text for display"""
+        lines = list(self.lines)
+        if self.current_line:
+            lines.append(f"🎤 {self.current_line}")
+        return "\n".join(lines)
+    
+    def export_transcript(self, filename: str):
+        """Export transcript with timestamps"""
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write("Real-Time Transcription Log\n")
+            f.write("=" * 50 + "\n\n")
+            for i, (line, timestamp) in enumerate(zip(self.lines, self.timestamps)):
+                f.write(f"[{timestamp.strftime('%H:%M:%S')}] {line}\n")
+
+class SmartTranscriber:
+    """Advanced transcription engine with Hinglish optimization"""
+    
+    def __init__(self, model_name: str = "base", device: str = "auto"):
+        self.device = self._get_optimal_device(device)
+        self.model = self._load_optimized_model(model_name)
+        self.audio_processor = AudioProcessor()
+        self.buffer = TranscriptionBuffer()
+        
+        # Hinglish-specific optimizations
+        self.hinglish_replacements = self._load_hinglish_corrections()
+        self.context_window = deque(maxlen=5)  # Context for better accuracy
+        
+    def _get_optimal_device(self, device: str) -> str:
+        """Determine optimal device for processing"""
+        if device == "auto":
+            if torch.cuda.is_available():
+                return "cuda"
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                return "mps"
+            else:
+                return "cpu"
+        return device
+    
+    def _load_optimized_model(self, model_name: str):
+        """Load and optimize Whisper model"""
+        print(f"Loading {model_name} model on {self.device}...")
+        
+        # Load model with optimizations
+        model = whisper.load_model(model_name, device=self.device)
+        
+        # Enable optimizations for faster inference
+        if self.device == "cuda":
+            model = model.half()  # Use FP16 for faster processing
+            
+        model.eval()
+        return model
+    
+    def _load_hinglish_corrections(self) -> Dict[str, str]:
+        """Load Hinglish-specific corrections and common phrases"""
+        return {
+            # Common Hinglish words that Whisper might mishear
+            "achha": "अच्छा",
+            "theek hai": "ठीक है", 
+            "kya baat hai": "क्या बात है",
+            "namaste": "नमस्ते",
+            "dhanyawad": "धन्यवाद",
+            "kaise ho": "कैसे हो",
+            "matlab": "मतलब",
+            "bilkul": "बिल्कुल",
+            "zaroor": "जरूर",
+            "samajh gaya": "समझ गया",
+            # Add more based on your specific needs
+        }
+    
+    def transcribe_chunk(self, audio_data: np.ndarray, is_final: bool = False) -> Tuple[str, float]:
+        """Transcribe audio chunk with enhanced processing"""
+        if len(audio_data) < 1600:  # Too short
+            return "", 0.0
+            
+        # Preprocess audio
+        processed_audio = self.audio_processor.preprocess_audio(audio_data)
+        
+        # Pad audio to ensure minimum length
+        min_length = 16000  # 1 second minimum
+        if len(processed_audio) < min_length:
+            processed_audio = np.pad(processed_audio, (0, min_length - len(processed_audio)))
+        
+        try:
+            # Enhanced transcription options for Indian languages
+            result = self.model.transcribe(
+                processed_audio,
+                language="hi",  # Hindi for better Hinglish support
+                task="transcribe",
+                fp16=self.device == "cuda",
+                temperature=0.2,  # Lower temperature for more consistent results
+                compression_ratio_threshold=2.4,
+                logprob_threshold=-1.0,
+                no_speech_threshold=0.6,
+                condition_on_previous_text=True,
+                initial_prompt="This is a conversation in Hinglish (Hindi-English mix) with Indian accent."
+            )
+            
+            text = result.get("text", "").strip()
+            
+            # Calculate confidence score
+            segments = result.get("segments", [])
+            confidence = np.mean([seg.get("avg_logprob", -1) for seg in segments]) if segments else 0.0
+            confidence = max(0, min(1, (confidence + 1) / 2))  # Normalize to 0-1
+            
+            # Apply Hinglish corrections
+            text = self._apply_hinglish_corrections(text)
+            
+            # Context-aware improvements
+            text = self._apply_context_corrections(text)
+            
+            return text, confidence
+            
+        except Exception as e:
+            print(f"Transcription error: {e}")
+            return "", 0.0
+    
+    def _apply_hinglish_corrections(self, text: str) -> str:
+        """Apply Hinglish-specific corrections"""
+        for wrong, correct in self.hinglish_replacements.items():
+            text = text.replace(wrong, correct)
+        return text
+    
+    def _apply_context_corrections(self, text: str) -> str:
+        """Apply context-aware corrections based on conversation history"""
+        # Add context to improve accuracy
+        self.context_window.append(text)
+        
+        # Simple context-based corrections
+        context = " ".join(self.context_window)
+        
+        # Example: Fix common misheard phrases based on context
+        corrections = [
+            ("i am", "I am"),
+            ("you are", "You are"),
+            ("what is", "What is"),
+            ("how are", "How are"),
+        ]
+        
+        for wrong, correct in corrections:
+            text = text.replace(wrong, correct)
+            
+        return text
+
+class RealTimeTranscriber:
+    """Main real-time transcription system"""
+    
+    def __init__(self, args):
+        self.args = args
+        self.transcriber = SmartTranscriber(args.model, args.device)
+        self.data_queue = Queue()
+        self.phrase_time = None
+        
+        # Setup microphone
+        self.setup_microphone()
+        
+        # Performance monitoring
+        self.stats = {
+            "chunks_processed": 0,
+            "avg_confidence": 0.0,
+            "start_time": datetime.now()
+        }
+    
+    def setup_microphone(self):
+        """Setup microphone with optimal settings"""
+        self.recorder = sr.Recognizer()
+        self.recorder.energy_threshold = self.args.energy_threshold
+        self.recorder.dynamic_energy_threshold = self.args.dynamic_energy
+        self.recorder.pause_threshold = 0.5
+        
+        # Platform-specific microphone setup
+        if sys.platform.startswith('linux'):
+            self.setup_linux_microphone()
+        else:
+            self.source = sr.Microphone(sample_rate=16000, chunk_size=512)
+        
+        # Calibrate for ambient noise
+        print("Calibrating microphone for ambient noise...")
+        with self.source:
+            self.recorder.adjust_for_ambient_noise(self.source, duration=2)
+        print(f"Microphone calibrated. Energy threshold: {self.recorder.energy_threshold}")
+    
+    def setup_linux_microphone(self):
+        """Linux-specific microphone setup"""
+        mic_name = self.args.default_microphone
+        if mic_name == 'list':
+            self.list_microphones()
+            sys.exit(0)
+        
+        for index, name in enumerate(sr.Microphone.list_microphone_names()):
+            if mic_name in name:
+                self.source = sr.Microphone(sample_rate=16000, device_index=index, chunk_size=512)
+                return
+        
+        print(f"Microphone '{mic_name}' not found. Using default.")
+        self.source = sr.Microphone(sample_rate=16000, chunk_size=512)
+    
+    def list_microphones(self):
+        """List available microphones"""
+        print("\nAvailable microphone devices:")
+        print("-" * 40)
+        for index, name in enumerate(sr.Microphone.list_microphone_names()):
+            print(f"{index:2d}: {name}")
+    
+    def record_callback(self, _, audio: sr.AudioData) -> None:
+        """Callback for audio recording"""
+        data = audio.get_raw_data()
+        self.data_queue.put(data)
+    
+    def display_interface(self):
+        """Display enhanced user interface"""
+        os.system('cls' if os.name == 'nt' else 'clear')
+        
+        print("🎙️  ADVANCED REAL-TIME SPEECH TRANSCRIPTION")
+        print("=" * 60)
+        print(f"Model: {self.args.model} | Device: {self.transcriber.device}")
+        print(f"Language: Hinglish/Hindi | Confidence Threshold: {self.args.confidence_threshold}")
+        print("-" * 60)
+        
+        # Display statistics
+        runtime = datetime.now() - self.stats["start_time"]
+        print(f"⏱️  Runtime: {str(runtime).split('.')[0]} | "
+              f"Chunks: {self.stats['chunks_processed']} | "
+              f"Avg Confidence: {self.stats['avg_confidence']:.2f}")
+        print("-" * 60)
+        
+        # Display transcription
+        print(self.transcriber.buffer.get_display_text())
+        print("\n" + "─" * 60)
+        print("Press Ctrl+C to stop and save transcript")
+    
+    def run(self):
+        """Main transcription loop"""
+        print("Starting background recording...")
+        
+        # Start background recording
+        self.recorder.listen_in_background(
+            self.source, 
+            self.record_callback, 
+            phrase_time_limit=self.args.record_timeout
+        )
+        
+        print("🎤 Listening... Speak now!")
+        
+        try:
+            while True:
+                self.process_audio_queue()
+                time.sleep(0.1)  # Small delay to prevent excessive CPU usage
+                
+        except KeyboardInterrupt:
+            self.cleanup()
+    
+    def process_audio_queue(self):
+        """Process audio data from queue"""
+        if self.data_queue.empty():
+            return
+        
+        now = datetime.now()
+        phrase_complete = False
+        
+        # Check if phrase is complete
+        if (self.phrase_time and 
+            now - self.phrase_time > timedelta(seconds=self.args.phrase_timeout)):
+            phrase_complete = True
+        
+        self.phrase_time = now
+        
+        # Collect audio data
+        audio_data = b''
+        while not self.data_queue.empty():
+            try:
+                audio_data += self.data_queue.get_nowait()
+            except Empty:
+                break
+        
+        if not audio_data:
+            return
+        
+        # Convert to numpy array
+        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+        
+        # Transcribe
+        text, confidence = self.transcriber.transcribe_chunk(audio_np, phrase_complete)
+        
+        # Update statistics
+        self.stats["chunks_processed"] += 1
+        self.stats["avg_confidence"] = (
+            (self.stats["avg_confidence"] * (self.stats["chunks_processed"] - 1) + confidence) 
+            / self.stats["chunks_processed"]
+        )
+        
+        # Update buffer based on confidence threshold
+        if confidence >= self.args.confidence_threshold:
+            if phrase_complete and text:
+                self.transcriber.buffer.add_line(text, confidence)
+            else:
+                self.transcriber.buffer.update_current(text)
+        
+        # Update display
+        self.display_interface()
+    
+    def cleanup(self):
+        """Cleanup and save transcript"""
+        print("\n\n🛑 Stopping transcription...")
+        
+        # Save transcript
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"transcript_{timestamp}.txt"
+        self.transcriber.buffer.export_transcript(filename)
+        
+        print(f"💾 Transcript saved to: {filename}")
+        print(f"📊 Total chunks processed: {self.stats['chunks_processed']}")
+        print(f"📈 Average confidence: {self.stats['avg_confidence']:.2f}")
+        print("\nFinal Transcript:")
+        print("=" * 50)
+        print(self.transcriber.buffer.get_display_text())
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="base", help="Model to use",
-                        choices=["tiny", "base", "small", "medium", "large"])
-    parser.add_argument("--english_only", action='store_true',
-                        help="Use the English-only model. The multilingual model is used by default and is better for accented English.")
-    parser.add_argument("--energy_threshold", default=1000, 
-                        help="Energy level for mic to detect.", type=int)
-    parser.add_argument("--record_timeout", default=2, 
-                        help="How real time the recording is in seconds.", type=float)
-    parser.add_argument("--phrase_timeout", default=3, 
-                        help="How much empty space between recordings before we consider it a new line in the transcription.", type=float)
-    if 'linux' in platform:
-        parser.add_argument("--default_microphone", default='pulse',
-                            help="Default microphone name for SpeechRecognition. ", type=str)
+    """Main function with enhanced argument parsing"""
+    parser = argparse.ArgumentParser(
+        description="Advanced Real-Time Speech Transcription with Hinglish Support",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python transcriber.py --model medium --device cuda
+  python transcriber.py --model large --confidence_threshold 0.7
+  python transcriber.py --list_mics  # List available microphones
+        """
+    )
+    
+    # Model options
+    parser.add_argument("--model", default="base", 
+                       choices=["tiny", "base", "small", "medium", "large"],
+                       help="Whisper model to use (default: base)")
+    
+    parser.add_argument("--device", default="auto",
+                       choices=["auto", "cpu", "cuda", "mps"],
+                       help="Device to run model on (default: auto)")
+    
+    # Audio settings
+    parser.add_argument("--energy_threshold", default=1000, type=int,
+                       help="Energy level for mic to detect speech (default: 1000)")
+    
+    parser.add_argument("--record_timeout", default=2.0, type=float,
+                       help="Recording chunk duration in seconds (default: 2.0)")
+    
+    parser.add_argument("--phrase_timeout", default=3.0, type=float,
+                       help="Pause duration before considering new phrase (default: 3.0)")
+    
+    parser.add_argument("--confidence_threshold", default=0.5, type=float,
+                       help="Minimum confidence score to display text (default: 0.5)")
+    
+    parser.add_argument("--dynamic_energy", action='store_true',
+                       help="Enable dynamic energy threshold adjustment")
+    
+    # Microphone settings
+    if sys.platform.startswith('linux'):
+        parser.add_argument("--default_microphone", default='pulse', type=str,
+                           help="Default microphone name for Linux (default: pulse)")
+    
+    parser.add_argument("--list_mics", action='store_true',
+                       help="List available microphones and exit")
+    
     args = parser.parse_args()
     
-    phrase_time = None
-    data_queue = Queue()
-    recorder = sr.Recognizer()
-    recorder.energy_threshold = args.energy_threshold
-    recorder.dynamic_energy_threshold = False
+    # List microphones if requested
+    if args.list_mics:
+        transcriber = RealTimeTranscriber(args)
+        transcriber.list_microphones()
+        return
     
-    if 'linux' in platform:
-        mic_name = args.default_microphone
-        if not mic_name or mic_name == 'list':
-            print("Available microphone devices are: ")
-            for index, name in enumerate(sr.Microphone.list_microphone_names()):
-                print(f'\"microphone({index})\" `{name}`')
-            return
-        else:
-            for index, name in enumerate(sr.Microphone.list_microphone_names()):
-                if mic_name in name:
-                    source = sr.Microphone(sample_rate=16000, device_index=index)
-                    break
-    else:
-        source = sr.Microphone(sample_rate=16000)
-        
-    model = args.model
-    if args.model != "large" and args.english_only:
-        model = model + ".en"
-    audio_model = whisper.load_model(model)
+    # Validate arguments
+    if not (0.0 <= args.confidence_threshold <= 1.0):
+        parser.error("confidence_threshold must be between 0.0 and 1.0")
     
-    record_timeout = args.record_timeout
-    phrase_timeout = args.phrase_timeout
+    print("🚀 Initializing Advanced Real-Time Transcription System...")
+    print(f"📱 Model: {args.model}")
+    print(f"🖥️  Device: {args.device}")
+    print(f"🎯 Confidence Threshold: {args.confidence_threshold}")
     
-    temp_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp.wav")
-    transcription = ['']
-    
-    with source:
-        recorder.adjust_for_ambient_noise(source)
-        
-    def record_callback(_, audio:sr.AudioData) -> None:
-        data = audio.get_raw_data()
-        data_queue.put(data)
-    
-    recorder.listen_in_background(source, record_callback, phrase_time_limit=record_timeout)
-    
-    print("Model loaded.\n")
-
-    while True:
-        try:
-            now = datetime.utcnow()
-            if not data_queue.empty():
-                phrase_complete = False
-                if phrase_time and now - phrase_time > timedelta(seconds=phrase_timeout):
-                    phrase_complete = True
-                phrase_time = now
-                
-                audio_data = b''.join(data_queue.queue)
-                data_queue.queue.clear()
-                
-                audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-                
-                result = audio_model.transcribe(audio_np, fp16=torch.cuda.is_available())
-                text = result['text'].strip()
-                
-                if phrase_complete:
-                    transcription.append(text)
-                else:
-                    transcription[-1] = text
-                
-                os.system('cls' if os.name=='nt' else 'clear')
-                for line in transcription:
-                    print(line)
-                print('', end='', flush=True)
-                
-                sleep(0.25)
-        except KeyboardInterrupt:
-            break
-    
-    print("\n\nTranscription:")
-    for line in transcription:
-        print(line)
+    # Create and run transcriber
+    transcriber = RealTimeTranscriber(args)
+    transcriber.run()
 
 if __name__ == "__main__":
     main()
+

@@ -1,6 +1,9 @@
 openai-whisper
 torch
 SpeechRecognition
+scipy
+webrtcvad-wheels
+librosa
 langdetect
+argostranslate
 numpy
-sounddevice
