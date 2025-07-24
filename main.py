@@ -26,10 +26,55 @@ import speech_recognition as sr
 from scipy import signal
 import webrtcvad
 import librosa
+import langdetect
+from langdetect import detect, LangDetectException
+import argostranslate.package
+import argostranslate.translate
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+# --- Language Detection and Translation ---
+
+def install_translation_models():
+    """Download and install Argos Translate models for supported languages."""
+    print("Checking for translation models...")
+    required_languages = {"hi", "mr", "ta"}
+    argostranslate.package.update_package_index()
+    available_packages = argostranslate.package.get_available_packages()
+    installed_languages = {lang.from_code for lang in argostranslate.translate.get_installed_languages()}
+
+    for lang_code in required_languages:
+        if lang_code not in installed_languages:
+            print(f"Downloading translation model for '{lang_code}'...")
+            try:
+                package_to_install = next(
+                    p for p in available_packages if p.from_code == lang_code and p.to_code == 'en'
+                )
+                package_to_install.install()
+                print(f"Model for '{lang_code}' installed successfully.")
+            except StopIteration:
+                print(f"Warning: Could not find translation package for '{lang_code}' to 'en'.")
+            except Exception as e:
+                print(f"Error installing model for '{lang_code}': {e}")
+
+def detect_language(text: str) -> str:
+    """Detect the language of a given text."""
+    if not text.strip():
+        return "unknown"
+    try:
+        return detect(text)
+    except LangDetectException:
+        return "unknown"
+
+def translate_text(text: str, from_code: str, to_code: str = "en") -> str:
+    """Translate text from a source language to a target language."""
+    try:
+        translation = argostranslate.translate.translate(text, from_code, to_code)
+        return translation
+    except Exception as e:
+        return f"Translation error: {e}"
 
 class AudioProcessor:
     """Advanced audio processing for better transcription quality"""
@@ -88,13 +133,17 @@ class TranscriptionBuffer:
         self.current_line = ""
         self.confidence_scores = deque(maxlen=max_lines)
         self.timestamps = deque(maxlen=max_lines)
+        self.languages = deque(maxlen=max_lines)
+        self.translations = deque(maxlen=max_lines)
         
-    def add_line(self, text: str, confidence: float = 0.0):
+    def add_line(self, text: str, confidence: float = 0.0, lang: str = "", translation: str = ""):
         """Add a complete line to the buffer"""
         if text.strip():
             self.lines.append(text.strip())
             self.confidence_scores.append(confidence)
             self.timestamps.append(datetime.now())
+            self.languages.append(lang)
+            self.translations.append(translation)
     
     def update_current(self, text: str):
         """Update the current line being transcribed"""
@@ -102,10 +151,18 @@ class TranscriptionBuffer:
     
     def get_display_text(self) -> str:
         """Get formatted text for display"""
-        lines = list(self.lines)
+        display_lines = []
+        for i, line in enumerate(self.lines):
+            lang = self.languages[i]
+            translation = self.translations[i]
+            display_line = f"[{lang}] {line}"
+            if translation:
+                display_line += f" -> (EN: {translation})"
+            display_lines.append(display_line)
+
         if self.current_line:
-            lines.append(f"🎤 {self.current_line}")
-        return "\n".join(lines)
+            display_lines.append(f"🎤 {self.current_line}")
+        return "\n".join(display_lines)
     
     def export_transcript(self, filename: str):
         """Export transcript with timestamps"""
@@ -392,9 +449,13 @@ class RealTimeTranscriber:
         )
         
         # Update buffer based on confidence threshold
-        if confidence >= self.args.confidence_threshold:
-            if phrase_complete and text:
-                self.transcriber.buffer.add_line(text, confidence)
+        if confidence >= self.args.confidence_threshold and text:
+            if phrase_complete:
+                lang = detect_language(text)
+                translation = ""
+                if lang in ["hi", "mr", "ta"]:
+                    translation = translate_text(text, lang)
+                self.transcriber.buffer.add_line(text, confidence, lang, translation)
             else:
                 self.transcriber.buffer.update_current(text)
         
@@ -413,12 +474,12 @@ class RealTimeTranscriber:
         print(f"💾 Transcript saved to: {filename}")
         print(f"📊 Total chunks processed: {self.stats['chunks_processed']}")
         print(f"📈 Average confidence: {self.stats['avg_confidence']:.2f}")
-        print("\nFinal Transcript:")
-        print("=" * 50)
-        print(self.transcriber.buffer.get_display_text())
 
 def main():
     """Main function with enhanced argument parsing"""
+    # Install translation models on first run
+    install_translation_models()
+
     parser = argparse.ArgumentParser(
         description="Advanced Real-Time Speech Transcription with Hinglish Support",
         formatter_class=argparse.RawDescriptionHelpFormatter,
