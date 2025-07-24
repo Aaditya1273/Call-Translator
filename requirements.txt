@@ -12,3 +12,6 @@ pygame
 pyttsx3
 edge-tts
 pydub
+streamlit
+streamlit-webrtc
+pandas
