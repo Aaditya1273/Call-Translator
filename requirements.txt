@@ -1,17 +1,15 @@
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch==2.3.1+cpu
+torchaudio==2.3.1+cpu
 openai-whisper
-torch
-SpeechRecognition
-scipy
-webrtcvad-wheels
-librosa
-langdetect
 argostranslate
+langdetect
+webrtcvad
+scipy
 numpy
-gTTS
-pygame
-pyttsx3
-edge-tts
 pydub
 streamlit
 streamlit-webrtc
-pandas
+gTTS
+librosa
+edge-tts

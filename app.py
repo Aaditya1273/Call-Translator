@@ -2,6 +2,10 @@ import streamlit as st
 import numpy as np
 import time
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
+import io
+import pandas as pd
+import os
+from datetime import datetime
 
 from core import (
     SmartTranscriber,
@@ -45,6 +49,14 @@ with st.spinner("Loading models, please wait..."):
     transcriber, tts_engine = load_models()
 
 st.session_state.transcriber = transcriber
+
+LOG_FILE = "conversation_log.csv"
+
+# --- LOGGING FUNCTION ---
+def log_to_csv(data):
+    df = pd.DataFrame([data])
+    file_exists = os.path.exists(LOG_FILE)
+    df.to_csv(LOG_FILE, mode='a', header=not file_exists, index=False)
 
 # --- SIDEBAR SETTINGS ---
 st.sidebar.title("Settings")
@@ -105,6 +117,15 @@ class AudioProcessor(AudioProcessorBase):
         st.session_state.translated_text = translation
         
         if translation:
+            log_entry = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "speaker": "N/A (Real-time)",
+                "original_text": text,
+                "source_language": lang,
+                "translated_text": translation,
+                "target_language": target_lang
+            }
+            log_to_csv(log_entry)
             self.generate_tts(translation, target_lang)
 
     def handle_chat_translation(self, text):
@@ -124,6 +145,15 @@ class AudioProcessor(AudioProcessorBase):
         st.session_state.chat_history.append(chat_entry)
         
         if translation:
+            log_entry = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "speaker": speaker,
+                "original_text": text,
+                "source_language": source_lang,
+                "translated_text": translation,
+                "target_language": target_lang
+            }
+            log_to_csv(log_entry)
             self.generate_tts(translation, target_lang)
 
     def generate_tts(self, text, lang):
@@ -136,33 +166,47 @@ class AudioProcessor(AudioProcessorBase):
             st.session_state.audio_output = None
 
 # --- UI DISPLAY ---
-webrtc_streamer(
-    key="speech-translator",
-    mode=WebRtcMode.SENDONLY,
-    audio_processor_factory=AudioProcessor,
-    media_stream_constraints={"audio": True, "video": False},
-    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
+tab1, tab2 = st.tabs(["Translator", "Conversation Log"])
 
-if st.session_state.mode == "Real-time Translation":
-    col1, col2 = st.columns(2)
-    with col1:
-        st.header("Live Transcription")
-        st.info(f"**Original:** {st.session_state.original_text}")
-        st.write(f"**Detected Language:** {st.session_state.detected_lang}")
-    with col2:
-        st.header("Translation")
-        st.success(f"**Translation:** {st.session_state.translated_text}")
+with tab1:
+    webrtc_streamer(
+        key="speech-translator",
+        mode=WebRtcMode.SENDONLY,
+        audio_processor_factory=AudioProcessor,
+        media_stream_constraints={"audio": True, "video": False},
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    )
+
+    if st.session_state.mode == "Real-time Translation":
+        col1, col2 = st.columns(2)
+        with col1:
+            st.header("Live Transcription")
+            st.info(f"**Original:** {st.session_state.original_text}")
+            st.write(f"**Detected Language:** {st.session_state.detected_lang}")
+        with col2:
+            st.header("Translation")
+            st.success(f"**Translation:** {st.session_state.translated_text}")
+            if st.session_state.audio_output:
+                st.audio(st.session_state.audio_output, format="audio/wav")
+                st.session_state.audio_output = None
+    else: # Two-Person Chat Mode
+        st.header("Conversation Log")
+        for entry in reversed(st.session_state.chat_history):
+            with st.chat_message("user" if entry["speaker"] == 'A' else "assistant"):
+                st.write(f"**Speaker {entry['speaker']} ({entry['source_lang']}):** {entry['original']}")
+                st.write(f"**Translation ({entry['target_lang']}):** {entry['translated']}")
+
         if st.session_state.audio_output:
-            st.audio(st.session_state.audio_output, format="audio/wav")
+            st.audio(st.session_state.audio_output, format="audio/wav", autoplay=True)
             st.session_state.audio_output = None
-else: # Two-Person Chat Mode
-    st.header("Conversation Log")
-    for entry in reversed(st.session_state.chat_history):
-        with st.chat_message("user" if entry["speaker"] == 'A' else "assistant"):
-            st.write(f"**Speaker {entry['speaker']} ({entry['source_lang']}):** {entry['original']}")
-            st.write(f"**Translation ({entry['target_lang']}):** {entry['translated']}")
 
-    if st.session_state.audio_output:
-        st.audio(st.session_state.audio_output, format="audio/wav", autoplay=True)
-        st.session_state.audio_output = None
+with tab2:
+    st.header("Full Conversation History")
+    if os.path.exists(LOG_FILE):
+        df = pd.read_csv(LOG_FILE)
+        st.dataframe(df)
+        if st.button("Clear Log"):
+            os.remove(LOG_FILE)
+            st.rerun()
+    else:
+        st.info("No conversation history found.")
